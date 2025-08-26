@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+
+  # MonkeyOCR Demo Frontend
+  monkeyocr-demo:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: monkeyocr-demo
+    ports:
+      - "8002:8002"
+    environment:
+      - API_BASE_URL=http://10.108.20.170:8001
+      - DEMO_HOST=0.0.0.0
+      - DEMO_PORT=8002
+
+    restart: unless-stopped
+    networks:
+      - monkeyocr-network
+
+networks:
+  monkeyocr-network:
+    driver: bridge
+
+volumes:
+  model_data:

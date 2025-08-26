@@ -1,0 +1,98 @@
+x-monkeyocr-base: &monkeyocr-base
+  image: docker.yyq2020.tk/bianbong/monkeyocr:latest
+  volumes:
+    - /www/wwwroot/MonkeyOCR/MonkeyOCR-pro-1.2B:/app/MonkeyOCR/model_weight
+    - /www/wwwroot/MonkeyOCR/docker/tmp:/app/tmp
+    # 挂载修改后的文件替换镜像中的文件
+    - ./entrypoint.sh:/app/MonkeyOCR/entrypoint.sh
+    - ./load_image.py:/app/MonkeyOCR/magic_pdf/utils/load_image.py
+    - ./enhanced_api.py:/app/MonkeyOCR/enhanced_api.py
+    - ./main.py:/app/MonkeyOCR/api/main.py
+    
+  environment:
+    - TMPDIR=/app/tmp
+    - CUDA_VISIBLE_DEVICES=0,1
+    - HF_HUB_CACHE=/app/MonkeyOCR/model_weight
+    - MODELSCOPE_CACHE=/app/MonkeyOCR/model_weight
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 2
+            capabilities: [gpu]
+
+services:
+  monkeyocr:
+    <<: *monkeyocr-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
+        LMDEPLOY_PATCHED: "false"
+    ports:
+      - "7860:7860"
+
+  monkeyocr-fix:
+    <<: *monkeyocr-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
+        LMDEPLOY_PATCHED: "true"
+    environment:
+      - TMPDIR=/app/tmp
+      - CUDA_VISIBLE_DEVICES=0,1
+      - HF_HUB_CACHE=/app/MonkeyOCR/model_weight
+      - MODELSCOPE_CACHE=/app/MonkeyOCR/model_weight
+    ports:
+      - "7860:7860"
+
+  monkeyocr-demo:
+    <<: *monkeyocr-base
+    entrypoint: ["/app/MonkeyOCR/entrypoint.sh"]
+    command: ["demo"]
+    ports:
+      - "8001:7860"
+
+  monkeyocr-dev:
+    <<: *monkeyocr-base
+    entrypoint: ["/app/MonkeyOCR/entrypoint.sh"]
+    command: ["bash"]
+    stdin_open: true
+    tty: true
+    ports:
+      - "7860:7860"
+
+  monkeyocr-api:
+    <<: *monkeyocr-base
+    entrypoint: ["/app/MonkeyOCR/entrypoint.sh"]
+    command: ["fastapi"]
+    ports:
+      - "8001:7861"
+    environment:
+      - TMPDIR=/app/tmp
+      - CUDA_VISIBLE_DEVICES=0,1
+      - HF_HUB_CACHE=/app/MonkeyOCR/model_weight
+      - MODELSCOPE_CACHE=/app/MonkeyOCR/model_weight
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=7861
+
+  monkeyocr-enhanced-api:
+    <<: *monkeyocr-base
+    entrypoint: ["/app/MonkeyOCR/entrypoint.sh"]
+    command: ["enhanced-api"]
+    ports:
+      - "8001:8000"  # Enhanced API port
+    environment:
+      - TMPDIR=/app/tmp
+      - CUDA_VISIBLE_DEVICES=0,1
+      - HF_HUB_CACHE=/app/MonkeyOCR/model_weight
+      - MODELSCOPE_CACHE=/app/MonkeyOCR/model_weight
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=8000
+
+volumes:
+  model_data:

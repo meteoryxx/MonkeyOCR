@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  # MonkeyOCR API service
+  monkeyocr-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MONKEYOCR_CONFIG=model_configs.yaml
+      - TMPDIR=/tmp
+    volumes:
+      - ../model_configs.yaml:/app/model_configs.yaml
+      - ../models:/app/models
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MCP Server service
+  monkeyocr-mcp:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    depends_on:
+      monkeyocr-api:
+        condition: service_healthy
+    environment:
+      - MONKEYOCR_API_URL=http://monkeyocr-api:8000
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    volumes:
+      - ./mcp-server:/app
+      - ../models:/app/models
+
+  # Optional: Nginx reverse proxy (if needed)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/ssl/certs
+    depends_on:
+      - monkeyocr-api
+    restart: unless-stopped
+
+volumes:
+  models:
+  data:
+
+networks:
+  default:
+    driver: bridge

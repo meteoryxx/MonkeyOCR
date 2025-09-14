@@ -421,6 +421,7 @@ async def root():
         "endpoints": {
             # Original OCR endpoints
             "ocr_text": "/ocr/text",
+            "ocr_url": "/ocr/url",
             "ocr_formula": "/ocr/formula", 
             "ocr_table": "/ocr/table",
             "parse": "/parse",
@@ -453,6 +454,15 @@ async def extract_formula(file: UploadFile = File(...)):
 async def extract_table(file: UploadFile = File(...)):
     """Extract tables from image or PDF"""
     return await perform_ocr_task(file, "table")
+
+@app.post("/ocr/url", response_model=TaskResponse)
+async def extract_text_from_url(
+    url: str = Form(...),
+    start_page: Optional[int] = Form(None),
+    end_page: Optional[int] = Form(None)
+):
+    """Extract text from PDF file via URL with optional page range"""
+    return await perform_ocr_task_from_url(url, "text", start_page, end_page)
 
 @app.post("/parse", response_model=ParseResponse)
 async def parse_document(file: UploadFile = File(...)):
@@ -963,6 +973,123 @@ async def perform_ocr_task(file: UploadFile, task_type: str) -> TaskResponse:
             task_type=task_type,
             content="",
             message=f"OCR task failed: {str(e)}"
+        )
+
+async def perform_ocr_task_from_url(url: str, task_type: str, start_page: Optional[int] = None, end_page: Optional[int] = None) -> TaskResponse:
+    """Perform OCR task on PDF file from URL with optional page range"""
+    try:
+        if not monkey_ocr_model:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Validate URL
+        if not url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="Invalid URL")
+        
+        # Download file from URL
+        import requests
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        # Determine file extension
+        content_type = response.headers.get('content-type', '')
+        if 'application/pdf' in content_type:
+            file_ext = '.pdf'
+        elif 'image/jpeg' in content_type:
+            file_ext = '.jpg'
+        elif 'image/png' in content_type:
+            file_ext = '.png'
+        else:
+            # Try to determine from URL
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            file_ext = os.path.splitext(parsed_url.path)[1].lower()
+            if file_ext not in ['.pdf', '.jpg', '.jpeg', '.png']:
+                file_ext = '.pdf'  # Default to PDF
+        
+        # Save downloaded file temporarily with unique name
+        import uuid
+        unique_suffix = str(uuid.uuid4())[:8]
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext, prefix=f"ocr_url_{unique_suffix}_") as temp_file:
+            temp_file.write(response.content)
+            temp_file_path = temp_file.name
+        
+        # If it's a PDF and page range is specified, extract pages
+        if file_ext == '.pdf' and (start_page is not None or end_page is not None):
+            from magic_pdf.utils.load_image import pdf_to_images
+            from PyPDF2 import PdfWriter, PdfReader
+            
+            # Read PDF
+            reader = PdfReader(temp_file_path)
+            total_pages = len(reader.pages)
+            
+            # Set default values for page range
+            start = max(1, start_page or 1)
+            end = min(total_pages, end_page or total_pages)
+            
+            # Validate page range
+            if start > end or start > total_pages or end > total_pages:
+                raise HTTPException(status_code=400, detail="Invalid page range")
+            
+            # Extract pages
+            writer = PdfWriter()
+            for i in range(start-1, end):
+                writer.add_page(reader.pages[i])
+            
+            # Save extracted pages to a new temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', prefix=f"ocr_url_extracted_{unique_suffix}_") as extracted_file:
+                writer.write(extracted_file)
+                extracted_file_path = extracted_file.name
+            
+            # Clean up original file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file {temp_file_path}: {cleanup_error}")
+            
+            # Update file path to extracted file
+            temp_file_path = extracted_file_path
+        
+        try:
+            # Create output directory with unique name
+            output_dir = tempfile.mkdtemp(prefix=f"monkeyocr_{task_type}_url_{unique_suffix}_")
+            
+            # Use optimized async single task recognition
+            result_dir = await async_single_task_recognition(temp_file_path, output_dir, task_type)
+            
+            # Read result file
+            def read_result_sync():
+                result_files = [f for f in os.listdir(result_dir) if f.endswith(f'_{task_type}_result.md')]
+                if not result_files:
+                    raise Exception("No result file generated")
+                
+                result_file_path = os.path.join(result_dir, result_files[0])
+                with open(result_file_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            
+            content = await asyncio.get_event_loop().run_in_executor(None, read_result_sync)
+            
+            return TaskResponse(
+                success=True,
+                task_type=task_type,
+                content=content,
+                message=f"{task_type.capitalize()} extraction from URL completed successfully"
+            )
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file {temp_file_path}: {cleanup_error}")
+            
+    except Exception as e:
+        logger.error(f"OCR task from URL failed: {str(e)}")
+        return TaskResponse(
+            success=False,
+            task_type=task_type,
+            content="",
+            message=f"OCR task from URL failed: {str(e)}"
         )
 
 @app.post("/parse-pdf", response_model=ParseResponse)

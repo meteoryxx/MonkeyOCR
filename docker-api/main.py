@@ -37,6 +37,10 @@ from magic_pdf.model.doc_analyze_by_custom_model_llm import doc_analyze_llm
 from PIL import Image
 import uvicorn
 
+# 添加定时清理任务相关的导入
+import schedule
+import threading
+
 # Response models
 class TaskResponse(BaseModel):
     success: bool
@@ -55,6 +59,8 @@ class ParseResponse(BaseModel):
     markdown_raw: Optional[str] = None
     layout_pdf_url: Optional[str] = None
     markdown_zip_url: Optional[str] = None
+    # 新增字段用于纯文本 Markdown 内容
+    markdown_text: Optional[str] = None
 
 class ChatResponse(BaseModel):
     success: bool
@@ -285,14 +291,18 @@ def process_pdf_to_markdown(file_path: str) -> tuple:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
         
-        # Create zip file
+        # Create zip file - 只包含当前处理的文件，而不是全部文件
         zip_path = os.path.join(parent_path, f"{name}_markdown.zip")
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # 只添加当前处理的文件到 ZIP 中
             for root, dirs, files in os.walk(local_md_dir):
                 for file in files:
                     file_path_inner = os.path.join(root, file)
-                    arc_name = os.path.relpath(file_path_inner, local_md_dir)
-                    zipf.write(file_path_inner, arc_name)
+                    # 只添加当前处理的文件，通过更精确的文件名匹配确保只包含相关文件
+                    # 同时确保包含 images 目录中的相关图片文件
+                    if file.startswith(name) or file == f"{name}.md" or (root.endswith('images') and name in file):
+                        arc_name = os.path.relpath(file_path_inner, local_md_dir)
+                        zipf.write(file_path_inner, arc_name)
         
         return md_content, md_content_ori, layout_pdf_path, zip_path
         
@@ -380,6 +390,9 @@ async def lifespan(app: FastAPI):
         initialize_model()
         model_type = "async-capable" if supports_async else "sync-only"
         logger.info(f"✅ MonkeyOCR model initialized successfully ({model_type})")
+        
+        # 启动定时清理任务
+        start_cleanup_scheduler()
     except Exception as e:
         logger.info(f"❌ Failed to initialize MonkeyOCR model: {e}")
         raise
@@ -1118,15 +1131,129 @@ async def parse_pdf(file: UploadFile = File(...)):
         layout_pdf_url = f"/static/{os.path.basename(layout_pdf_path)}" if layout_pdf_path and os.path.exists(layout_pdf_path) else None
         zip_url = f"/static/{os.path.basename(zip_path)}" if zip_path and os.path.exists(zip_path) else None
         
+        # 保存 Markdown 内容到临时文件，以便后续通过 API 获取
+        name = '.'.join(filename.split(".")[:-1])
+        md_file_path = os.path.join(temp_dir, f"{name}.md")
+        with open(md_file_path, 'w', encoding='utf-8') as f:
+            f.write(md_content_ori)
+        
         return ParseResponse(
             success=True,
             message="PDF parsed successfully",
             markdown_content=md_content,
             markdown_raw=md_content_ori,
+            markdown_text=md_content_ori,  # 新增纯文本 Markdown 内容
             layout_pdf_url=layout_pdf_url,
             markdown_zip_url=zip_url,
             files=[layout_pdf_path, zip_path] if layout_pdf_path and zip_path else []
         )
+        
+    except Exception as e:
+        logger.error(f"Error parsing PDF: {e}")
+        return ParseResponse(
+            success=False,
+            message=f"Error parsing PDF: {str(e)}"
+        )
+
+@app.get("/parse-pdf/text/{file_id}")
+async def get_markdown_text(file_id: str):
+    """获取纯文本 Markdown 内容"""
+    try:
+        # 在临时目录中查找对应的 Markdown 文件
+        md_file_path = os.path.join(temp_dir, f"{file_id}.md")
+        if os.path.exists(md_file_path):
+            with open(md_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return JSONResponse(content={"markdown_text": content})
+        else:
+            raise HTTPException(status_code=404, detail="Markdown file not found")
+    except Exception as e:
+        logger.error(f"Error retrieving markdown text: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving markdown text: {str(e)}")
+
+@app.get("/parse-pdf/raw/{file_id}")
+async def get_raw_markdown(file_id: str):
+    """获取原始 Markdown 内容（不带图片的纯文本）"""
+    try:
+        # 在临时目录中查找对应的 Markdown 文件
+        md_file_path = os.path.join(temp_dir, f"{file_id}.md")
+        if os.path.exists(md_file_path):
+            with open(md_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return JSONResponse(content={"raw_markdown": content})
+        else:
+            raise HTTPException(status_code=404, detail="Markdown file not found")
+    except Exception as e:
+        logger.error(f"Error retrieving raw markdown: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving raw markdown: {str(e)}")
+
+@app.post("/parse-pdf/selective", response_model=ParseResponse)
+async def parse_pdf_selective(
+    file: UploadFile = File(...),
+    output_format: str = Form("html", description="Output format: 'html', 'text', or 'zip'")
+):
+    """Parse PDF to Markdown with selectable output format"""
+    if not file.filename.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
+        raise HTTPException(status_code=400, detail="Only PDF and image files are supported")
+    
+    if output_format not in ["html", "text", "zip"]:
+        raise HTTPException(status_code=400, detail="Invalid output format. Use 'html', 'text', or 'zip'")
+    
+    try:
+        # Save uploaded file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{file.filename}"
+        file_path = os.path.join(temp_dir, filename)
+        
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Process the file
+        def process_file():
+            return process_pdf_to_markdown(file_path)
+        
+        md_content, md_content_ori, layout_pdf_path, zip_path = await smart_model_call(process_file)
+        
+        # Generate URLs for downloadable files
+        layout_pdf_url = f"/static/{os.path.basename(layout_pdf_path)}" if layout_pdf_path and os.path.exists(layout_pdf_path) else None
+        zip_url = f"/static/{os.path.basename(zip_path)}" if zip_path and os.path.exists(zip_path) else None
+        
+        # 保存 Markdown 内容到临时文件，以便后续通过 API 获取
+        name = '.'.join(filename.split(".")[:-1])
+        md_file_path = os.path.join(temp_dir, f"{name}.md")
+        with open(md_file_path, 'w', encoding='utf-8') as f:
+            f.write(md_content_ori)
+        
+        # 根据请求的格式返回不同的响应
+        if output_format == "text":
+            # 只返回纯文本 Markdown
+            return ParseResponse(
+                success=True,
+                message="PDF parsed successfully (text only)",
+                markdown_text=md_content_ori,
+                files=[md_file_path] if md_file_path else []
+            )
+        elif output_format == "zip":
+            # 只返回 ZIP 文件
+            return ParseResponse(
+                success=True,
+                message="PDF parsed successfully (ZIP only)",
+                markdown_zip_url=zip_url,
+                files=[zip_path] if zip_path else []
+            )
+        else:
+            # 返回完整 HTML 格式
+            return ParseResponse(
+                success=True,
+                message="PDF parsed successfully",
+                markdown_content=md_content,
+                markdown_raw=md_content_ori,
+                markdown_text=md_content_ori,
+                layout_pdf_url=layout_pdf_url,
+                markdown_zip_url=zip_url,
+                files=[layout_pdf_path, zip_path] if layout_pdf_path and zip_path else []
+            )
         
     except Exception as e:
         logger.error(f"Error parsing PDF: {e}")
@@ -1239,3 +1366,82 @@ async def preview_file(
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7861)
+
+# 添加定时清理任务
+
+def cleanup_temp_files():
+    """清理超过2天的临时文件"""
+    try:
+        current_time = time.time()
+        two_days_ago = current_time - (2 * 24 * 60 * 60)  # 2天前的时间戳
+        
+        # 清理临时目录中的文件
+        if os.path.exists(temp_dir):
+            for filename in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, filename)
+                # 检查文件修改时间
+                if os.path.isfile(file_path):
+                    file_modified_time = os.path.getmtime(file_path)
+                    if file_modified_time < two_days_ago:
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"Cleaned up old temporary file: {file_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+                # 也检查目录
+                elif os.path.isdir(file_path):
+                    dir_modified_time = os.path.getmtime(file_path)
+                    if dir_modified_time < two_days_ago:
+                        try:
+                            shutil.rmtree(file_path, ignore_errors=True)
+                            logger.info(f"Cleaned up old temporary directory: {file_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove temporary directory {file_path}: {e}")
+        
+        # 清理其他可能的临时文件和目录
+        temp_dirs = [tempfile.gettempdir()]
+        for temp_dir_path in temp_dirs:
+            if os.path.exists(temp_dir_path):
+                for root, dirs, files in os.walk(temp_dir_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        # 检查是否是 monkeyocr 相关的临时文件
+                        if 'monkeyocr' in file.lower() or 'upload' in file.lower() or 'preview' in file.lower() or 'markdown' in file.lower() or 'layout' in file.lower():
+                            file_modified_time = os.path.getmtime(file_path)
+                            if file_modified_time < two_days_ago:
+                                try:
+                                    os.remove(file_path)
+                                    logger.info(f"Cleaned up old temporary file: {file_path}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+                    
+                    # 清理与monkeyocr相关的临时目录
+                    for dir_name in dirs:
+                        dir_path = os.path.join(root, dir_name)
+                        if 'monkeyocr' in dir_name.lower() or 'markdown' in dir_name.lower() or 'layout' in dir_name.lower():
+                            try:
+                                # 检查目录中的文件修改时间
+                                dir_modified_time = os.path.getmtime(dir_path)
+                                if dir_modified_time < two_days_ago:
+                                    shutil.rmtree(dir_path, ignore_errors=True)
+                                    logger.info(f"Removed old temporary directory: {dir_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to remove temporary directory {dir_path}: {e}")
+                                
+    except Exception as e:
+        logger.error(f"Error during temporary file cleanup: {e}")
+
+def start_cleanup_scheduler():
+    """启动定时清理任务"""
+    # 每天执行一次清理任务
+    schedule.every().day.at("02:00").do(cleanup_temp_files)
+    
+    def run_scheduler():
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # 每分钟检查一次
+    
+    # 在后台线程中运行调度器
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("Temporary file cleanup scheduler started")

@@ -11,12 +11,12 @@ layout_config:
 chat_config:
   weight_path: model_weight/Recognition
   backend: lmdeploy # lmdeploy / vllm / transformers / api / lmdeploy_queue / vllm_queue
-  batch_size: 10 # active when using `transformers` as backend
+  batch_size: 4 # 从10降低到4,减少每批次处理的内存占用
   # if using xxx_queue as backend
   queue_config:
-    max_batch_size: 256 # maximum batch size for internal processing
+    max_batch_size: 128 # 从256降低到128,减少最大批处理大小
     queue_timeout: 1 # seconds to wait for batching requests
-    max_queue_size: 2000 # maximum requests in queue
+    max_queue_size: 1000 # 从2000降低到1000,减少队列占用
 
 # Uncomment the following lines if use `api` as backend 
 # api_config:

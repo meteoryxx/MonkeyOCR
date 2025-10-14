@@ -51,33 +51,26 @@ elif [ "$1" = "bash" ]; then
     exec /bin/bash
 elif [ "$1" = "fastapi" ]; then
     log_info "Starting FastAPI server"
-    mkdir -p /app/tmp
-    cd /app/MonkeyOCR
-    exec uvicorn api.main:app --host ${FASTAPI_HOST:-0.0.0.0} --port ${FASTAPI_PORT:-7861}
-elif [ "$1" = "apianddemo" ]; then
-    log_info "Starting combined API and Demo servers"
+    pip install fastapi-mcp uvicorn schedule
     mkdir -p /app/tmp
     cd /app/MonkeyOCR
     
-    # Use the combined server script
-    log_info "Starting combined server with shared model instance"
-    exec python combined_server.py
-elif [ "$1" = "apidemo" ]; then
-    log_info "Starting integrated API with Demo"
-    mkdir -p /app/tmp
-    cd /app/MonkeyOCR
+    # 设置默认worker数量为1,避免多个进程重复加载模型
+    WORKERS=${UVICORN_WORKERS:-1}
+    TIMEOUT=${UVICORN_TIMEOUT_KEEP_ALIVE:-30}
+    LIMIT_CONCURRENCY=${UVICORN_LIMIT_CONCURRENCY:-10}
     
-    # Use the integrated API with demo script
-    log_info "Starting FastAPI server with integrated Gradio demo"
-    exec python api_with_demo.py
-elif [ "$1" = "enhanced-api" ]; then
-    log_info "Starting Enhanced FastAPI server"
-    mkdir -p /app/tmp
-    cd /app/MonkeyOCR
+    log_info "Starting uvicorn with workers=$WORKERS, timeout=$TIMEOUT, limit_concurrency=$LIMIT_CONCURRENCY"
     
-    # Use the enhanced API script
-    log_info "Starting Enhanced FastAPI server with full PDF to Markdown features"
-    exec python enhanced_api.py
+    # 使用单worker模式,避免多进程重复加载模型导致内存占用过高
+    exec uvicorn api.main:app \
+        --host ${FASTAPI_HOST:-0.0.0.0} \
+        --port ${FASTAPI_PORT:-7861} \
+        --workers ${WORKERS} \
+        --timeout-keep-alive ${TIMEOUT} \
+        --limit-concurrency ${LIMIT_CONCURRENCY} \
+        --backlog 100
+
 else
     log_info "Executing custom command: $*"
     exec "$@"

@@ -1,0 +1,42 @@
+# docker-compose.ocr2.yml
+version: '3.8'
+
+services:
+  ocrdocker-gpu1:
+    image: docker.yyq2020.tk/bianbong/monkeyocr:latest
+    # 删除 runtime: nvidia
+    deploy:  # 注意:deploy 在普通 docker-compose up 中部分字段无效!
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+        # 添加内存限制,防止内存溢出
+        limits:
+          memory: 20G  # 限制容器最大内存使用20GB
+          # cpus: '4'  # 可选:限制CPU核心数
+    # ✅ 更可靠的方式:使用 environment + command 覆盖,但关键还是 gpus
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - TMPDIR=/app/tmp
+      - HF_HUB_CACHE=/app/MonkeyOCR/model_weight
+      - MODELSCOPE_CACHE=/app/MonkeyOCR/model_weight
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=7861
+      # 添加优化环境变量
+      - OMP_NUM_THREADS=2  # 限制OpenMP线程数,减少CPU内存占用
+      - MKL_NUM_THREADS=2  # 限制MKL线程数
+      - UVICORN_WORKERS=1  # 只使用1个worker,避免重复加载模型
+      - UVICORN_TIMEOUT_KEEP_ALIVE=30  # 设置keep-alive超时
+      - UVICORN_LIMIT_CONCURRENCY=10  # 限制并发连接数
+    volumes:
+      - /www/wwwroot/MonkeyOCR/MonkeyOCR-pro-1.2B:/app/MonkeyOCR/model_weight
+      - /www/wwwroot/MonkeyOCR/docker/tmp2:/app/tmp
+      - ./entrypoint.sh:/app/MonkeyOCR/entrypoint.sh
+      - ./load_image.py:/app/MonkeyOCR/magic_pdf/utils/load_image.py
+      - ./main.py:/app/MonkeyOCR/api/main.py
+    entrypoint: ["/app/MonkeyOCR/entrypoint.sh"]
+    command: ["fastapi"]
+    ports:
+      - "8002:7861"

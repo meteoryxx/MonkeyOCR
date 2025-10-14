@@ -40,6 +40,8 @@ import uvicorn
 # 添加定时清理任务相关的导入
 import schedule
 import threading
+import gc  # 添加垃圾回收模块
+import psutil  # 添加进程监控模块
 
 # Response models
 class TaskResponse(BaseModel):
@@ -1370,10 +1372,14 @@ if __name__ == "__main__":
 # 添加定时清理任务
 
 def cleanup_temp_files():
-    """清理超过2天的临时文件"""
+    """清理超过1天的临时文件(从2天缩短到1天)"""
     try:
         current_time = time.time()
-        two_days_ago = current_time - (2 * 24 * 60 * 60)  # 2天前的时间戳
+        one_day_ago = current_time - (1 * 24 * 60 * 60)  # 1天前的时间戳
+        
+        cleaned_files = 0
+        cleaned_dirs = 0
+        freed_space = 0
         
         # 清理临时目录中的文件
         if os.path.exists(temp_dir):
@@ -1382,19 +1388,27 @@ def cleanup_temp_files():
                 # 检查文件修改时间
                 if os.path.isfile(file_path):
                     file_modified_time = os.path.getmtime(file_path)
-                    if file_modified_time < two_days_ago:
+                    if file_modified_time < one_day_ago:
                         try:
+                            file_size = os.path.getsize(file_path)
                             os.remove(file_path)
-                            logger.info(f"Cleaned up old temporary file: {file_path}")
+                            cleaned_files += 1
+                            freed_space += file_size
+                            logger.debug(f"Cleaned up old temporary file: {file_path}")
                         except Exception as e:
                             logger.warning(f"Failed to remove temporary file {file_path}: {e}")
                 # 也检查目录
                 elif os.path.isdir(file_path):
                     dir_modified_time = os.path.getmtime(file_path)
-                    if dir_modified_time < two_days_ago:
+                    if dir_modified_time < one_day_ago:
                         try:
+                            dir_size = sum(os.path.getsize(os.path.join(dirpath, f)) 
+                                         for dirpath, _, filenames in os.walk(file_path) 
+                                         for f in filenames)
                             shutil.rmtree(file_path, ignore_errors=True)
-                            logger.info(f"Cleaned up old temporary directory: {file_path}")
+                            cleaned_dirs += 1
+                            freed_space += dir_size
+                            logger.debug(f"Cleaned up old temporary directory: {file_path}")
                         except Exception as e:
                             logger.warning(f"Failed to remove temporary directory {file_path}: {e}")
         
@@ -1407,13 +1421,19 @@ def cleanup_temp_files():
                         file_path = os.path.join(root, file)
                         # 检查是否是 monkeyocr 相关的临时文件
                         if 'monkeyocr' in file.lower() or 'upload' in file.lower() or 'preview' in file.lower() or 'markdown' in file.lower() or 'layout' in file.lower():
-                            file_modified_time = os.path.getmtime(file_path)
-                            if file_modified_time < two_days_ago:
-                                try:
-                                    os.remove(file_path)
-                                    logger.info(f"Cleaned up old temporary file: {file_path}")
-                                except Exception as e:
-                                    logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+                            try:
+                                file_modified_time = os.path.getmtime(file_path)
+                                if file_modified_time < one_day_ago:
+                                    try:
+                                        file_size = os.path.getsize(file_path)
+                                        os.remove(file_path)
+                                        cleaned_files += 1
+                                        freed_space += file_size
+                                        logger.debug(f"Cleaned up old temporary file: {file_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+                            except Exception:
+                                pass
                     
                     # 清理与monkeyocr相关的临时目录
                     for dir_name in dirs:
@@ -1422,19 +1442,45 @@ def cleanup_temp_files():
                             try:
                                 # 检查目录中的文件修改时间
                                 dir_modified_time = os.path.getmtime(dir_path)
-                                if dir_modified_time < two_days_ago:
-                                    shutil.rmtree(dir_path, ignore_errors=True)
-                                    logger.info(f"Removed old temporary directory: {dir_path}")
-                            except Exception as e:
-                                logger.warning(f"Failed to remove temporary directory {dir_path}: {e}")
+                                if dir_modified_time < one_day_ago:
+                                    try:
+                                        dir_size = sum(os.path.getsize(os.path.join(dirpath, f)) 
+                                                     for dirpath, _, filenames in os.walk(dir_path) 
+                                                     for f in filenames)
+                                        shutil.rmtree(dir_path, ignore_errors=True)
+                                        cleaned_dirs += 1
+                                        freed_space += dir_size
+                                        logger.debug(f"Removed old temporary directory: {dir_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to remove temporary directory {dir_path}: {e}")
+                            except Exception:
+                                pass
+        
+        # 强制垃圾回收
+        gc.collect()
+        
+        if cleaned_files > 0 or cleaned_dirs > 0:
+            freed_mb = freed_space / (1024 * 1024)
+            logger.info(f"Cleanup completed: {cleaned_files} files, {cleaned_dirs} directories removed, freed {freed_mb:.2f}MB")
+        
+        # 记录内存使用情况
+        try:
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            logger.info(f"Memory usage: RSS={mem_info.rss / (1024**3):.2f}GB, VMS={mem_info.vms / (1024**3):.2f}GB")
+        except Exception:
+            pass
                                 
     except Exception as e:
         logger.error(f"Error during temporary file cleanup: {e}")
 
 def start_cleanup_scheduler():
     """启动定时清理任务"""
-    # 每天执行一次清理任务
-    schedule.every().day.at("02:00").do(cleanup_temp_files)
+    # 每6小时执行一次清理任务(从每天一次改为每6小时一次,更积极)
+    schedule.every(6).hours.do(cleanup_temp_files)
+    
+    # 启动时立即执行一次清理
+    threading.Thread(target=cleanup_temp_files, daemon=True).start()
     
     def run_scheduler():
         while True:
@@ -1444,4 +1490,4 @@ def start_cleanup_scheduler():
     # 在后台线程中运行调度器
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    logger.info("Temporary file cleanup scheduler started")
+    logger.info("Temporary file cleanup scheduler started (runs every 6 hours)")
